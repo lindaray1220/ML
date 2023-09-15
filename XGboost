@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+import json
+import sys
+from typing import Any, List, Optional
+
+import fblearner.flow.api as flow
+import fblearner.flow.projects.datascience.hte.models.xgboost
+import fblearner.flow.projects.datascience.hte.models.xlearner
+import fblearner.flow.projects.datascience.hte.models.xlearner_dev
+import fblearner.flow.projects.fluent2.api as f2
+import fblearner.flow.projects.fluent2.workflows.utils.common as f2_common
+import pandas as pd
+from fblearner.flow import external_api
+from fblearner.flow.api import types
+from fblearner.flow.core.functional import Output
+from fblearner.flow.core.utilities import SerialOperatorExecution
+from fblearner.flow.projects.datascience.hte.defaults import Learner_Names, OWNER
+from fblearner.flow.projects.datascience.hte.models.slearner import SLearnerTransformer
+from fblearner.flow.projects.datascience.hte.models.tlearner import (
+    HTETLearnerTransformer,
+)
+from fblearner.flow.projects.datascience.hte.models.xgboost import HTEXGBoostLearner
+from fblearner.flow.projects.datascience.hte.models.xlearner import (
+    HTEXLearnerTransformer,
+)
+from fblearner.flow.projects.datascience.hte.models.xlearner_dev import (
+    HTEXLearnerTransformerDev,
+)
+from fblearner.flow.projects.datascience.hte.online_publish import (
+    PublishWorkflow as OnlinePublishWorkflow,
+)
+from fblearner.flow.projects.datascience.hte.types import (
+    HiveDataset,
+    InvalidInputException,
+    MetaLearnerType,
+)
+from fblearner.flow.projects.datascience.hte.utils import (
+    generate_partition_clause,
+    get_model_type,
+    get_model_type_name,
+    path2dataset,
+    preprocess_gbdt_features,
+)
+from fblearner.flow.projects.datascience.swisscheese.io import get_run_id, get_run_owner
+from fblearner.flow.projects.fluent2.definition.feature import Feature
+from fblearner.flow.projects.fluent2.workflows import const
+from fblearner.flow.projects.fluent2.workflows.publish import PublishWorkflow
+from pvc import load
+
+# As of D39929946, we've moved several model modules (e.g.
+# HTEXLearnerTransformer), which breaks Flow External API's get_inputs()
+# due to pickle.load()s
+# Workaround: Just link the old module paths to the new ones, so pickle
+# can find those classes
+sys.modules[
+    "fblearner.flow.projects.fluent2.definition.transformers.contrib.hte.hte_models"
+] = fblearner.flow.projects.datascience.hte.models.xlearner
+sys.modules[
+    "fblearner.flow.projects.fluent2.definition.transformers.contrib.hte.hte_xgboost"
+] = fblearner.flow.projects.datascience.hte.models.xgboost
+
+XGBOOST_THREADS = 1
+LEARNING_RATE = 0.01
+TREE_DEPTH = 5
+XGBOOST_MAX_NUM_ROUNDS = 100
+XGBOOST_EARLY_STOP_ROUNDS = 20
+XGBOOST_VALIDATION_PERCENT = 0.1
+
+
+@flow.typed()
+def get_transformer(
+    meta_learner_type: MetaLearnerType, all_features: Any, is_metric_binary: bool
+) -> HTEXLearnerTransformer:
+    if meta_learner_type == MetaLearnerType.X_LEARNER:
+        return HTEXLearnerTransformer(
+            name="hte_xlearner",
+            features=all_features,
+            training_sets_filter=f2.PatternFilter("%:tlearner_training"),
+            validation_sets_filter=f2.PatternFilter("%:xlearner_training"),
+            control_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+            treatment_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+            xlearner=HTEXGBoostLearner(
+                params={
+                    "objective": "reg:squarederror",
+                    "eval_metric": "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("x_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("x_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("x_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+        )
+    elif meta_learner_type == MetaLearnerType.X_LEARNER_DEV:
+        return HTEXLearnerTransformerDev(
+            name="hte_xlearner_dev",
+            features=all_features,
+            training_sets_filter=f2.PatternFilter("%:tlearner_training"),
+            validation_sets_filter=f2.PatternFilter("%:xlearner_training"),
+            control_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+            treatment_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+            xlearner=HTEXGBoostLearner(
+                params={
+                    "objective": "reg:squarederror",
+                    "eval_metric": "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("x_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("x_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("x_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+        )
+    elif meta_learner_type == MetaLearnerType.T_LEARNER:
+        return HTETLearnerTransformer(
+            name="hte_tlearner",
+            features=all_features,
+            training_sets_filter=f2.PatternFilter("%:tlearner_training"),
+            validation_sets_filter=None,
+            control_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+            treatment_base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("t_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("t_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("t_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+        )
+    elif meta_learner_type == MetaLearnerType.S_LEARNER:
+        return SLearnerTransformer(
+            name="hte_slearner",
+            features=all_features,
+            training_sets_filter=f2.PatternFilter("%:slearner_training"),
+            validation_sets_filter=None,
+            base_learner=HTEXGBoostLearner(
+                params={
+                    "objective": "binary:logistic"
+                    if is_metric_binary
+                    else "reg:squarederror",
+                    "eval_metric": "logloss" if is_metric_binary else "rmse",
+                    "nthread": XGBOOST_THREADS,
+                    "learning_rate": f2.Sweeping.get_parameter_value("s_learning_rate")
+                    or LEARNING_RATE,
+                    "max_depth": f2.Sweeping.get_parameter_value("s_max_depth")
+                    or TREE_DEPTH,
+                    "subsample": f2.Sweeping.get_parameter_value("s_subsample") or 1.0,
+                },
+                num_boost_round=XGBOOST_MAX_NUM_ROUNDS,
+                early_stopping_rounds=XGBOOST_EARLY_STOP_ROUNDS,
+                validation_percent=XGBOOST_VALIDATION_PERCENT,
+            ),
+        )
+    else:
+        raise ValueError("Unsupported metalearner type")
+
+
+@flow.typed(
+    input_schema=types.Schema(
+        eval_table_path=types.TEXT,
+        prediction_table_name=types.TEXT,
+        run_id=types.INTEGER,
+        prediction_table_oncall=types.TEXT,
+        prediction_table_owner=types.NULLABLE(types.TEXT),
+        evaluate_output=types.NULLABLE(types.ANY),
+    ),
+    returns=types.PYTHONOBJECT(f2.Domain),
+)
+def get_domain(
+    eval_table_path: str,
+    prediction_table_name: str,
+    run_id: int,
+    prediction_table_oncall: str,
+    prediction_table_owner: Optional[str],
+    evaluate_output: Optional[Output] = None,
+):
+    # hive table with features for new users
+    dataset = path2dataset(eval_table_path)
+    partition_clause = generate_partition_clause(dataset)
+    # decide whether the metric is binary
+    fb_run = external_api.WorkflowRun(run_id)
+
+    is_metric_binary = fb_run.get_inputs_summary().get("is_metric_binary", False)
+
+    # In the case of logged features, just look at the transformer
+    if evaluate_output:
+        output = evaluate_output
+        model_file = evaluate_output[
+            "training_output"
+        ].transformer_name_to_model_file_path
+    else:
+        summary = fb_run.get_results()
+        output = summary.get("model_outputs") or summary.get("output") or summary
+        try:
+            # this would fail if the operators are gone
+            model_file = get_hteaas_model_files(fb_run)
+        except Exception:
+            try:
+                # it would still work because the outputs will be there (the retention is
+                # at least larger than a year)
+                model_file = output.training_output.transformer_name_to_model_file_path
+                model_file = {
+                    learner: model_file[learner]
+                    for learner in Learner_Names
+                    if learner in model_file
+                }
+            except Exception as e:
+                raise ValueError(
+                    "We can't find the model path from the workflow operators nor the outputs!"
+                ) from e
+    # get meta_learner_type from model file key (remove leading "hte_")
+    meta_learner_type = list(model_file.keys())[0][4:]
+    if "training_output" in output:
+        output = output["training_output"]
+    domain_union = output.domain_union_with_object
+    domain = f2_common.get_domain(domain_union)
+    feature_fetcher = [
+        t for t in domain.transformers if isinstance(t, f2.FeatureFetcher)
+    ][0]
+    context_column = feature_fetcher.feature_group.context_fields[0].name
+    feature_group_name = feature_fetcher.feature_group.name
+    feature_group_team = feature_fetcher.feature_group.team
+    feature_group_version = feature_fetcher.feature_group.version or "0.0"
+    features = []
+    for t in domain.transformers:
+        # Combines features from Xlearner + HashCategoricals Transformers
+        if not isinstance(t, f2.FeatureFetcher):
+            # Only include the features with value_hql not None to ensure correct Categoricals
+            features.extend(f for f in t.features if f.value_hql)
+
+    check_trained_with_feature_store = 1
+    # check if all features are included in the hive table
+    if "hive_info" in fb_run.get_inputs_summary():
+        if not check_features_in_eval_hive_table(features, dataset):
+            raise InvalidInputException(
+                "Detected that the evaluation table is missing the required features used in training"
+            )
+        if "feature_group_name" not in fb_run.get_inputs_summary()["hive_info"]:
+            check_trained_with_feature_store = 0
+
+    context = f2.Context(f2.StringSingleCategoricalContextField(context_column))
+
+    # if Feature Store group was given at training time, should not overwrite it
+    if check_trained_with_feature_store:
+        feature_group = f2.FeatureStore.get_group(
+            team_name=feature_group_team,
+            group_name=feature_group_name,
+            version=str(feature_group_version),
+        )
+        all_fg_features = f2.FeatureFetcher(
+            feature_group=feature_group,
+            context={context_column: context[context_column]},
+            use_logged_features=True,
+        ).get_output_features()
+        # Filter down to only those features with matching columns in
+        # the training table. Also copy over the hql
+        all_features = []
+        for f in features:
+            if f.name in all_fg_features.keys():
+                all_fg_features[f.name].value_hql = f.value_hql
+                all_features.append(all_fg_features[f.name])
+    else:
+        # create hive feature group for new user features
+        for f in features:
+            f.origin = None
+        feature_group = f2.HiveFeatureGroup(
+            team="datascience",
+            name=feature_group_name,
+            owner=f2.Owner(
+                prediction_table_owner or get_run_owner() or OWNER,
+                oncall=prediction_table_oncall,
+            ),
+            context_fields=[context[context_column]],
+            context_fields_hql=[context_column],
+            schedule="@never",
+            wait_for_tables=[],
+            from_hql=f"""
+            FROM {dataset.tablename}
+            WHERE {partition_clause}
+            """,
+            features=features,
+            scheduler_config=f2.SchedulerConfig(
+                hive_config=f2.SparkConfig(namespace=dataset.namespace)
+            ),
+        )
+
+        all_features = list(
+            f2.FeatureFetcher(
+                feature_group=feature_group,
+                context={context_column: context[context_column]},
+            ).get_output_features()
+        )
+
+    feature_expr = (
+        """FB_MAP_VALUE_FILTER_F(
+                MAP({float_features})
+            ) AS float_features,
+            FB_MAP_VALUE_FILTER_F(
+                MAP({int_features})
+            ) AS int_features,
+            FB_MAP_VALUE_FILTER_F(
+                MAP({bool_features})
+            ) AS bool_features,
+            FB_MAP_VALUE_FILTER_F(
+                MAP({string_single_categorical_features})
+            ) AS string_single_categorical_features,""".format(
+            float_features=", ".join(
+                "{id}L, FLOAT({hql})".format(id=f.id, hql=f.value_hql)
+                for f in all_features
+                if isinstance(f, f2.FloatFeature)
+            ),
+            int_features=", ".join(
+                "{id}L, INT({hql})".format(id=f.id, hql=f.value_hql)
+                for f in all_features
+                if isinstance(f, f2.IntFeature)
+            ),
+            bool_features=", ".join(
+                "{id}L, INT({hql})".format(id=f.id, hql=f.value_hql)
+                for f in all_features
+                if isinstance(f, f2.BoolFeature)
+            ),
+            string_single_categorical_features=", ".join(
+                "{id}L, STRING({hql})".format(id=f.id, hql=f.value_hql)
+                for f in all_features
+                if isinstance(f, f2.StringSingleCategoricalFeature)
+            ),
+        )
+        if check_trained_with_feature_store
+        else ""
+    )
+
+    # preprocess the features to be xgboost compatible
+    # also update the hashed features to match the training
+    # feature ids
+    all_features = preprocess_gbdt_features(all_features)
+    root_transformer = get_transformer(
+        meta_learner_type, all_features, is_metric_binary
+    )
+    root_transformer.align_ids_with_external_model = True
+
+    # For models trained with Feature Store group, we add feature_expr
+    # that manually embeds the feature values
+    candidates_fetcher = f2.QueryCandidatesFetcher(
+        wait_for_tables=[],
+        hql=f"""
+        SELECT
+            {feature_expr}
+            CAST({context_column} AS VARCHAR) AS {context_column}
+        FROM {dataset.tablename}
+        WHERE {partition_clause}
+        """,
+    )
+
+    model_type = get_model_type()
+    return f2.Domain(
+        team="__looper",
+        name=f"HTEaaS_prediction__{get_run_id()}",
+        model_type=model_type.name,
+        storage_config=f2.ManifoldConfig(bucket="looper_model_cache"),
+        owner=f2.Owner(get_run_owner(), prediction_table_oncall),
+        root_transformer=root_transformer,
+        training=f2.ExternalTraining(
+            schedule="@daily",
+            examples_fetchers=[],
+            transformer_name_to_model_file_path=model_file,
+        ),
+        offline_predicting=f2.OfflinePredicting(
+            schedule="@daily",
+            candidates_fetcher=candidates_fetcher,
+            publishers=[
+                f2.SimpleHivePublisher(
+                    table=prediction_table_name,
+                    partition={"ds": "<DATEID>"},
+                    oncall=prediction_table_oncall,
+                )
+            ],
+        ),
+        scheduler_config=f2.SchedulerConfig(
+            query_engine_config=f2.SparkConfig(
+                namespace=dataset.namespace, retention_days=3
+            ),
+            # This experimental feature executes everything in one FBL operator.
+            # single_operator_execution=True,
+        ),
+        prefer_pytorch=True,
+    )
+
+
+@flow.flow_async()
+@flow.registered(owners=["oncall+cds_product_algorithms"])
+@flow.typed(
+    input_schema=types.Schema(
+        recurring_period=types.RECURRINGPERIOD,
+    )
+    + get_domain.input_schema,
+    returns=PublishWorkflow.output_schema,
+)
+def run(recurring_period, **domain_params):
+    domain = get_domain(**domain_params)
+    return PublishWorkflow(
+        recurring_period,
+        const.DOMAIN_UNION_TYPE.new(domain=domain),
+        publisher_name="hive",
+    )
+
+
+@flow.flow_async()
+@flow.registered(owners=["oncall+cds_product_algorithms"])
+@flow.typed(
+    input_schema=types.Schema(
+        recurring_period=types.RECURRINGPERIOD,
+        run_id=types.INTEGER,
+    ),
+    returns=OnlinePublishWorkflow.output_schema,
+)
+def run_online_publish(
+    recurring_period,
+    run_id: int,
+):
+    wf_run = external_api.WorkflowRun(run_id)
+    summary = wf_run.get_results()
+    # HTEaaS Workflow output can be wrapped in `model_outputs` after switch to
+    # Unified HTEWorkflow or wrapped in `output` for backwards compatibility
+    output = summary.get("model_outputs") or summary.get("output") or summary
+    if "training_output" in output:
+        output = output["training_output"]
+    domain = output.domain_union_with_object.domain
+
+    domain.training.evaluate_when_publishing = False
+    domain.model_type = get_model_type_name()
+    model_type = get_model_type()
+    # Calls custom HTEaaS online_publish.PublishWorkflow as OnlinePublishWorkflow
+    return OnlinePublishWorkflow(
+        recurring_period,
+        const.DOMAIN_UNION_TYPE.new(domain=domain),
+        use_workflow_run_id_as_model_id=False,
+        workflow_id=run_id,
+        model_id=run_id,
+        model_type=model_type,
+    )
+
+
+def get_hteaas_model_files(fb_run: external_api.WorkflowRun):
+    fb_run = check_child_run(fb_run)
+    for op in fb_run.get_operator_runs():
+        if ("[hte_xlearner]TrainWorkflow" in op.get_name().split(".")[-1]) or (
+            "[hte_xlearner][PyTorchTrainWorkflow]Train" in op.get_name().split(".")[-1]
+        ):
+            return {"hte_xlearner": op.get_outputs().model_file_path}
+        elif ("[hte_tlearner]TrainWorkflow" in op.get_name().split(".")[-1]) or (
+            "[hte_tlearner][PyTorchTrainWorkflow]Train" in op.get_name().split(".")[-1]
+        ):
+            return {"hte_tlearner": op.get_outputs().model_file_path}
+        elif ("[hte_slearner]TrainWorkflow" in op.get_name().split(".")[-1]) or (
+            "[hte_slearner][PyTorchTrainWorkflow]Train" in op.get_name().split(".")[-1]
+        ):
+            return {"hte_slearner": op.get_outputs().model_file_path}
+        elif ("[hte_xlearner_dev]TrainWorkflow" in op.get_name().split(".")[-1]) or (
+            "[hte_xlearner_dev][PyTorchTrainWorkflow]Train"
+            in op.get_name().split(".")[-1]
+        ):
+            return {"hte_xlearner_dev": op.get_outputs().model_file_path}
+    raise ValueError("Can't find model file in the operators!")
+
+
+def check_child_run(fb_run: external_api.WorkflowRun):
+    # get best child run for hyperparameter tuning runs
+    if len(fb_run.get_children()) != 0:  # for sweep
+        if "best_run" in fb_run.get_children()[0].get_results_summary():
+            best_sweep_run_id = fb_run.get_children()[0].get_results_summary()[
+                "best_run"
+            ]["run_id"]
+            return external_api.WorkflowRun(best_sweep_run_id)
+        # for AxSweep runs
+        if "best_trial" in fb_run.get_children()[0].get_results_summary():
+            best_trial_dict = json.loads(
+                fb_run.get_children()[0].get_results_summary()["best_trial"]
+            )
+            best_sweep_run_id = pd.DataFrame(
+                best_trial_dict["data"], columns=best_trial_dict["columns"]
+            )["workflow_run_id"][0]
+            return external_api.WorkflowRun(best_sweep_run_id)
+    return fb_run
+
+
+def check_features_in_eval_hive_table(
+    features: List[Feature], dataset: HiveDataset
+) -> bool:
+    select_features = ""
+    for feature in features:
+        select_features += "{}, \n".format(feature.value_hql)
+    with SerialOperatorExecution():
+        try:
+            load(
+                sql="""
+                SELECT
+                {select_features}
+                FROM {{dataset}}
+                LIMIT 1
+                """.format(
+                    select_features=select_features[:-3]
+                ),
+                refs=dict(dataset=dataset),
+            )
+        except Exception:
+            return False
+    return True
